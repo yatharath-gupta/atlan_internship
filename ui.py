@@ -301,6 +301,101 @@ class AtlanRAGSystem:
         except Exception as e:
             logger.error(f"Error in retrieve_relevant_chunks: {e}")
             return []
+        
+
+    def _is_response_helpful(self, response: str, query: str) -> bool:
+        """Check if the response is helpful and comprehensive"""
+        if not response or len(response.strip()) < 100:
+            return False
+        
+        # Check for unhelpful patterns
+        unhelpful_patterns = [
+            "i don't have enough information",
+            "please contact support",
+            "i cannot help",
+            "not available in the documentation",
+            "unable to provide",
+            "contact your administrator"
+        ]
+        
+        response_lower = response.lower()
+        for pattern in unhelpful_patterns:
+            if pattern in response_lower:
+                return False
+        
+        # Check for helpful indicators
+        helpful_patterns = [
+            "you can",
+            "try",
+            "follow these steps",
+            "here's how",
+            "to do this",
+            "configure",
+            "set up",
+            "navigate to",
+            "click on"
+        ]
+        
+        helpful_count = sum(1 for pattern in helpful_patterns if pattern in response_lower)
+        return helpful_count >= 2  # At least 2 helpful indicators
+    
+    def _generate_fallback_response(self, query: str, classification: TicketClassification) -> str:
+        """Generate a fallback response when primary generation fails"""
+        topic = classification.topic
+        
+        # Topic-specific fallback responses
+        fallback_responses = {
+            "How-to": f"""I understand you're looking for guidance on how to accomplish something in Atlan. While I don't have specific documentation for your exact question, I can suggest some general approaches:
+
+1. **Check the Atlan Help Center**: Visit the official documentation for step-by-step guides
+2. **Use the Search Function**: Try searching within your Atlan instance for relevant features
+3. **Explore the Interface**: Many features have tooltips and help text when you hover over them
+4. **Community Resources**: Check if there are community forums or user groups for additional insights
+
+Based on your question about "{query[:100]}...", you might want to look into the relevant section of the platform that deals with this functionality.""",
+
+            "Product": f"""I see you have a question about Atlan's product features. While I don't have specific information about your particular scenario, here are some general suggestions:
+
+1. **Feature Documentation**: Check the official product documentation for detailed feature explanations
+2. **Product Updates**: Look for recent release notes that might address your question
+3. **Best Practices**: Consider if there are established best practices for your use case
+4. **Alternative Approaches**: There might be multiple ways to achieve what you're looking for
+
+For your specific question about "{query[:100]}...", I'd recommend exploring the relevant product area in more detail.""",
+
+            "Connector": f"""Regarding your connector question, here are some general troubleshooting and guidance steps:
+
+1. **Connector Documentation**: Check the specific connector's documentation for setup and configuration details
+2. **Connection Settings**: Verify all connection parameters are correct
+3. **Permissions**: Ensure proper permissions are set on both Atlan and the source system
+4. **Network Connectivity**: Confirm network access between systems
+5. **Logs and Diagnostics**: Check system logs for any error messages
+
+For your question about "{query[:100]}...", these steps might help identify the issue or provide the guidance you need.""",
+
+            "API/SDK": f"""For API and SDK related questions, here are some general approaches:
+
+1. **API Documentation**: Refer to the official API documentation for endpoints and parameters
+2. **Authentication**: Ensure you have proper API keys and authentication setup
+3. **Rate Limits**: Check if you're hitting any API rate limits
+4. **SDK Examples**: Look for code examples in the SDK documentation
+5. **Error Handling**: Implement proper error handling in your code
+
+Regarding your question about "{query[:100]}...", these resources should help you find the specific implementation details you need."""
+        }
+        
+        # Get topic-specific response or default
+        fallback = fallback_responses.get(topic, f"""I understand you have a question about {topic}. While I don't have specific documentation for your exact scenario, I recommend:
+
+1. **Official Documentation**: Check Atlan's help center and documentation
+2. **Support Resources**: Look for relevant guides and tutorials
+3. **Community**: Consider reaching out to user communities for insights
+4. **Experimentation**: Try exploring the relevant features in a test environment
+
+For your specific question about "{query[:100]}...", these approaches should help you find the information or solution you're looking for.""")
+        
+        return fallback
+
     
     def generate_rag_response(self, query: str, classification: TicketClassification, max_retries: int = 3) -> RAGResponse:
         """Generate RAG response with improved fallback handling"""

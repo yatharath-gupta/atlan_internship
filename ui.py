@@ -302,77 +302,141 @@ class AtlanRAGSystem:
             logger.error(f"Error in retrieve_relevant_chunks: {e}")
             return []
     
-    def generate_rag_response(self, query: str, classification: TicketClassification) -> RAGResponse:
-        """Generate RAG response for RAG-enabled topics"""
+    def generate_rag_response(self, query: str, classification: TicketClassification, max_retries: int = 3) -> RAGResponse:
+        """Generate RAG response with improved fallback handling"""
         
-        # Check if topic supports RAG
-        rag_topics = ["How-to", "Product", "API/SDK", "Best Practices", "SSO"]
-        
-        if classification.topic not in rag_topics:
-            return RAGResponse(
-                query=query,
-                answer=f"This ticket has been classified as '{classification.topic}' and routed to the appropriate team.",
-                sources=[],
-                confidence_score=0.8,
-                response_metadata={
-                    "routed": True,
-                    "topic": classification.topic
-                }
-            )
-        
-        # Retrieve relevant chunks (only if ChromaDB is available)
+        # Retrieve relevant chunks (always attempt, regardless of topic)
         chunks = []
         if self.chromadb_available:
-            chunks = self.retrieve_relevant_chunks(query, top_k=10)
+            chunks = self.retrieve_relevant_chunks(query, top_k=15, similarity_threshold=0.05)  # Lower threshold for more results
+            logger.info(f"Retrieved {len(chunks)} chunks for query")
+        else:
+            logger.info("ChromaDB not available, using expert knowledge mode")
         
-        if not chunks:
-            fallback_message = "I couldn't find specific information in the Atlan documentation for your query." if self.chromadb_available else "RAG functionality is currently unavailable due to database connectivity issues."
-            return RAGResponse(
-                query=query,
-                answer=f"{fallback_message} Your ticket has been forwarded to our support team for personalized assistance.",
-                sources=[],
-                confidence_score=0.3,
-                response_metadata={"no_context": True, "chromadb_available": self.chromadb_available}
-            )
+        # Determine response strategy based on available context
+        if chunks and len(chunks) >= 3:
+            # High confidence - good context available
+            context = "\n".join([f"Source {i+1}: {chunk.content}" for i, chunk in enumerate(chunks[:8])])  # More context
+            confidence_boost = 0.2
+            response_type = "full_context"
+            logger.info("Using full context mode with 8 chunks")
+        elif chunks and len(chunks) >= 1:
+            # Medium confidence - some context available
+            context = "\n".join([f"Source {i+1}: {chunk.content}" for i, chunk in enumerate(chunks[:5])])
+            confidence_boost = 0.1
+            response_type = "partial_context"
+            logger.info(f"Using partial context mode with {len(chunks)} chunks")
+        else:
+            # Low confidence - no specific context, but still attempt to help
+            context = f"""No specific documentation found for this query. However, as an Atlan expert, I can provide guidance based on general platform knowledge and common patterns for {classification.topic} questions.
+            
+    Based on the topic '{classification.topic}' and your question, I will draw from my knowledge of data catalog and governance platforms to provide helpful guidance."""
+            confidence_boost = 0.0
+            response_type = "expert_knowledge"
+            logger.info("Using expert knowledge mode - no specific documentation found")
         
-        # Prepare context
-        context = "\n".join([f"Source {i+1}: {chunk.content}" for i, chunk in enumerate(chunks[:5])])
+        # Initialize answer
+        answer = ""
         
-        # Generate response
-        response_prompt = get_customer_response_prompt(
-            query=query,
-            context=context,
-            classification=classification
-        )
-
-        try:
-            model = genai.GenerativeModel(self.generation_model)
-            response = model.generate_content(
-                response_prompt,
-                generation_config=genai.GenerationConfig(
-                    temperature=0.3,
-                    top_p=0.8,
-                    max_output_tokens=1024,
+        # Generate response with multiple attempts
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Generating response attempt {attempt + 1}/{max_retries}")
+                
+                # Modify context for retry attempts to encourage more detailed responses
+                enhanced_context = context
+                if attempt > 0:
+                    enhanced_context += f"\n\nIMPORTANT: Previous attempts were not comprehensive enough. Provide MORE detailed, actionable guidance with specific steps, examples, and alternatives. Do NOT simply refer to support - be helpful and thorough."
+                
+                response_prompt = get_customer_response_prompt(
+                    query=query,
+                    context=enhanced_context,
+                    classification=classification
                 )
-            )
-            
-            answer = response.text
-            
-        except Exception as e:
-            answer = f"I found relevant information but encountered an error generating the response. Please contact support for assistance. Error: {str(e)}"
+
+                model = genai.GenerativeModel(self.generation_model)
+                response = model.generate_content(
+                    response_prompt,
+                    generation_config=genai.GenerationConfig(
+                        temperature=0.4 if response_type == "expert_knowledge" else 0.2,  # Higher creativity for expert knowledge
+                        top_p=0.9,
+                        max_output_tokens=2000,  # Increased token limit for more comprehensive responses
+                        candidate_count=1
+                    )
+                )
+                
+                if response and response.text:
+                    answer = response.text.strip()
+                    logger.info(f"Generated response of length: {len(answer)}")
+                    
+                    # Validate response quality
+                    if self._is_response_helpful(answer, query):
+                        logger.info("Response validated as helpful")
+                        break
+                    elif attempt < max_retries - 1:
+                        logger.warning(f"Response not helpful enough, retrying... (attempt {attempt + 1})")
+                        continue
+                    else:
+                        logger.warning("All attempts exhausted, using current response")
+                else:
+                    logger.error("Empty response received from model")
+                    if attempt == max_retries - 1:
+                        answer = self._generate_fallback_response(query, classification)
+                    continue
+                    
+            except Exception as e:
+                error_msg = str(e).lower()
+                logger.error(f"Error generating response (attempt {attempt + 1}): {e}")
+                
+                if "quota" in error_msg or "rate limit" in error_msg or "resource exhausted" in error_msg:
+                    logger.warning(f"Rate limit hit during response generation, rotating API key...")
+                    self._rotate_api_key()
+                    time.sleep(1)  # Brief pause after key rotation
+                    continue
+                elif "safety" in error_msg or "blocked" in error_msg:
+                    logger.warning("Response blocked by safety filters, trying with modified prompt")
+                    # For safety blocks, try with a more neutral context
+                    context = f"Please provide helpful technical guidance for this {classification.topic} question in a professional manner."
+                    continue
+                else:
+                    if attempt == max_retries - 1:
+                        logger.error("All attempts failed, using fallback response")
+                        answer = self._generate_fallback_response(query, classification)
+                    continue
         
-        # Calculate confidence
-        avg_similarity = sum(chunk.similarity_score for chunk in chunks) / len(chunks) if chunks else 0
-        confidence = min(avg_similarity * 1.2, 1.0)  # Boost confidence slightly
+        # If we still don't have an answer, use fallback
+        if not answer or len(answer.strip()) < 50:
+            logger.warning("No valid response generated, using fallback")
+            answer = self._generate_fallback_response(query, classification)
+        
+        # Calculate confidence based on context and response quality
+        base_confidence = 0.4  # Increased minimum confidence
+        if chunks:
+            avg_similarity = sum(chunk.similarity_score for chunk in chunks) / len(chunks)
+            context_confidence = min(avg_similarity * 1.2, 0.6)  # Cap at 0.6
+            logger.info(f"Average chunk similarity: {avg_similarity:.3f}")
+        else:
+            context_confidence = 0.3 if response_type == "expert_knowledge" else 0.1  # Higher confidence in expert knowledge
+        
+        # Response quality bonus
+        response_quality_bonus = 0.1 if self._is_response_helpful(answer, query) else 0
+        
+        final_confidence = min(base_confidence + context_confidence + confidence_boost + response_quality_bonus, 1.0)
+        
+        logger.info(f"Final response confidence: {final_confidence:.3f}")
         
         return RAGResponse(
             query=query,
             answer=answer,
-            sources=chunks[:5],  # Limit sources shown
-            confidence_score=confidence,
+            sources=chunks[:5] if chunks else [],  # Return top 5 sources for display
+            confidence_score=final_confidence,
             response_metadata={
                 "chunks_retrieved": len(chunks),
-                "avg_similarity": avg_similarity
+                "response_type": response_type,
+                "avg_similarity": sum(chunk.similarity_score for chunk in chunks) / len(chunks) if chunks else 0,
+                "chromadb_available": self.chromadb_available,
+                "attempts_made": max_retries,
+                "final_answer_length": len(answer)
             }
         )
 

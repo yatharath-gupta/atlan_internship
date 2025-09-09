@@ -7,11 +7,27 @@ from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from datetime import datetime
 import google.generativeai as genai
-import chromadb
 import re
 from urllib.parse import urlparse
 import pandas as pd
 from sample import SAMPLE
+
+# Fix SQLite issue before importing ChromaDB
+try:
+    # Fix for SQLite version issue
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+    import chromadb
+    CHROMADB_AVAILABLE = True
+except ImportError as e:
+    st.error(f"ChromaDB import failed: {e}")
+    CHROMADB_AVAILABLE = False
+    chromadb = None
+except RuntimeError as e:
+    st.error(f"ChromaDB runtime error: {e}")
+    CHROMADB_AVAILABLE = False
+    chromadb = None
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -49,7 +65,7 @@ class TicketClassification:
 class AtlanRAGSystem:
     def __init__(self, 
                  gemini_api_keys: List[str],
-                 chromadb_config: Dict[str, str],
+                 chromadb_config: Dict[str, str] = None,
                  generation_model: str = "gemini-2.0-flash-exp",
                  embedding_model: str = "models/text-embedding-004",
                  collection_name: str = "atlan_docs"):
@@ -58,20 +74,32 @@ class AtlanRAGSystem:
         self.current_key_index = 0
         self.generation_model = generation_model
         self.embedding_model = embedding_model
+        self.chromadb_available = CHROMADB_AVAILABLE
         
-        # Initialize ChromaDB
-        self.chroma_client = chromadb.CloudClient(**chromadb_config)
-        self.collection = self.chroma_client.get_collection(collection_name)
+        # Initialize ChromaDB only if available
+        if self.chromadb_available and chromadb_config and chromadb:
+            try:
+                self.chroma_client = chromadb.CloudClient(**chromadb_config)
+                self.collection = self.chroma_client.get_collection(collection_name)
+                
+                # Check collection status
+                collection_count = self.collection.count()
+                logger.info(f"AtlanRAGSystem initialized successfully. Collection has {collection_count} documents.")
+                
+                if collection_count == 0:
+                    logger.warning("⚠️ ChromaDB collection is empty! Please run the embedding generation script first.")
+            except Exception as e:
+                logger.error(f"Failed to initialize ChromaDB: {e}")
+                self.chromadb_available = False
+                self.chroma_client = None
+                self.collection = None
+        else:
+            logger.warning("ChromaDB not available - running in classification-only mode")
+            self.chroma_client = None
+            self.collection = None
         
         # Configure initial API key
         self._configure_gemini()
-        
-        # Check collection status
-        collection_count = self.collection.count()
-        logger.info(f"AtlanRAGSystem initialized successfully. Collection has {collection_count} documents.")
-        
-        if collection_count == 0:
-            logger.warning("⚠️ ChromaDB collection is empty! Please run the embedding generation script first.")
     
     def _configure_gemini(self):
         """Configure Gemini API with current key"""
@@ -82,6 +110,7 @@ class AtlanRAGSystem:
         self.current_key_index = (self.current_key_index + 1) % len(self.gemini_api_keys)
         self._configure_gemini()
         logger.info(f"Rotated to API key {self.current_key_index + 1}")
+
     def load_sample_tickets():
         """Load sample tickets for demonstration"""
         sample_tickets = SAMPLE
@@ -194,6 +223,9 @@ class AtlanRAGSystem:
     
     def generate_query_embedding(self, query: str, max_retries: int = 3) -> List[float]:
         """Generate embedding for the query with retry logic"""
+        if not self.chromadb_available:
+            raise Exception("ChromaDB not available - cannot generate embeddings")
+            
         for attempt in range(max_retries):
             try:
                 response = genai.embed_content(
@@ -222,6 +254,10 @@ class AtlanRAGSystem:
                                 top_k: int = 15,
                                 similarity_threshold: float = 0.1) -> List[RetrievedChunk]:
         """Retrieve relevant chunks from ChromaDB"""
+        
+        if not self.chromadb_available or not self.collection:
+            logger.warning("ChromaDB not available - returning empty chunks")
+            return []
         
         try:
             # Generate query embedding
@@ -284,16 +320,19 @@ class AtlanRAGSystem:
                 }
             )
         
-        # Retrieve relevant chunks
-        chunks = self.retrieve_relevant_chunks(query, top_k=10)
+        # Retrieve relevant chunks (only if ChromaDB is available)
+        chunks = []
+        if self.chromadb_available:
+            chunks = self.retrieve_relevant_chunks(query, top_k=10)
         
         if not chunks:
+            fallback_message = "I couldn't find specific information in the Atlan documentation for your query." if self.chromadb_available else "RAG functionality is currently unavailable due to database connectivity issues."
             return RAGResponse(
                 query=query,
-                answer="I couldn't find specific information in the Atlan documentation for your query. Your ticket has been forwarded to our support team for personalized assistance.",
+                answer=f"{fallback_message} Your ticket has been forwarded to our support team for personalized assistance.",
                 sources=[],
                 confidence_score=0.3,
-                response_metadata={"no_context": True}
+                response_metadata={"no_context": True, "chromadb_available": self.chromadb_available}
             )
         
         # Prepare context
@@ -461,17 +500,20 @@ def initialize_rag_system():
     if "rag_system" not in st.session_state:
         # Configuration - Add your actual API keys here
         GEMINI_API_KEYS = [
-               "AIzaSyAFHriOAJQFwaVcSgAXpdyUW_DvIPdWQd4",
-        "AIzaSyA2eGfn-HYFgVVU3146LQMqD_QVIf_7snY", 
-        "AIzaSyAwjBzdYJVQUehCCLigvjNKOEb3Szo6HkY",
-        "AIzaSyCWvK_GYiy2ZpITZxpWb7453zFzoN_VqmM"
+            "AIzaSyAFHriOAJQFwaVcSgAXpdyUW_DvIPdWQd4",
+            "AIzaSyA2eGfn-HYFgVVU3146LQMqD_QVIf_7snY", 
+            "AIzaSyAwjBzdYJVQUehCCLigvjNKOEb3Szo6HkY",
+            "AIzaSyCWvK_GYiy2ZpITZxpWb7453zFzoN_VqmM"
         ]
         
-        CHROMADB_CONFIG = {
-              'api_key': 'ck-GgDLCLEeXKAEhpWCWMDwcFP1hEVH4gpqhii25vw98XSC',
-            'tenant': '94df3293-175e-443f-994a-22655697ffc9',
-            'database': 'atlan'
-        }
+        # Only use ChromaDB config if available
+        CHROMADB_CONFIG = None
+        if CHROMADB_AVAILABLE:
+            CHROMADB_CONFIG = {
+                'api_key': 'ck-GgDLCLEeXKAEhpWCWMDwcFP1hEVH4gpqhii25vw98XSC',
+                'tenant': '94df3293-175e-443f-994a-22655697ffc9',
+                'database': 'atlan'
+            }
         
         try:
             if not GEMINI_API_KEYS or GEMINI_API_KEYS == ['']:
@@ -482,7 +524,11 @@ def initialize_rag_system():
                 gemini_api_keys=GEMINI_API_KEYS,
                 chromadb_config=CHROMADB_CONFIG
             )
-            st.success("✅ RAG System initialized successfully!")
+            
+            if CHROMADB_AVAILABLE:
+                st.success("✅ RAG System initialized successfully!")
+            else:
+                st.warning("⚠️ RAG System initialized in classification-only mode (ChromaDB unavailable)")
             
         except Exception as e:
             st.error(f"❌ Failed to initialize RAG system: {e}")
@@ -664,14 +710,17 @@ def main():
         # System status
         st.markdown("### System Status")
         if "rag_system" in st.session_state:
-            st.success("🟢 RAG System Online")
-            
-            # Show collection count
-            try:
-                count = st.session_state.rag_system.collection.count()
-                st.write(f"📚 Documents: {count}")
-            except:
-                st.write("📚 Documents: Unknown")
+            if CHROMADB_AVAILABLE:
+                st.success("🟢 RAG System Online")
+                # Show collection count
+                try:
+                    count = st.session_state.rag_system.collection.count()
+                    st.write(f"📚 Documents: {count}")
+                except:
+                    st.write("📚 Documents: Unknown")
+            else:
+                st.warning("🟡 Classification Only Mode")
+                st.write("📚 Documents: ChromaDB unavailable")
         else:
             st.error("🔴 RAG System Offline")
     
@@ -683,5 +732,6 @@ def main():
         interactive_ai_agent()
     elif page == "Bulk Ticket Dashboard":
         bulk_ticket_dashboard()
+
 if __name__ == "__main__":
     main()

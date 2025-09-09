@@ -11,9 +11,13 @@ build==1.3.0
 cachetools==5.5.2
 catalogue==2.0.10
 certifi==2025.8.3
-pysqlite3-binary
 charset-normalizer==3.4.3
 chromadb==1.0.20
+streamlit==1.49.1
+google-generativeai
+pandas
+pysqlite3-binary
+chromadb
 click==8.2.1
 cloudpathlib==0.22.0
 coloredlogs==15.0.1

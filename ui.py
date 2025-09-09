@@ -1,4 +1,5 @@
 import time
+from conversational_mode import conversational_ai_mode
 from prompts import get_classification_prompt, get_customer_response_prompt
 import streamlit as st
 import json
@@ -841,6 +842,9 @@ def interactive_ai_agent():
         
         st.markdown('</div>', unsafe_allow_html=True)
 
+
+# ...existing code... (keep everything the same until the main() function)
+
 def main():
     """Main Streamlit application"""
     
@@ -850,10 +854,10 @@ def main():
         st.markdown("## 🏢 Atlan AI Support")
         st.markdown("---")
         
-        # Navigation - Changed default to Interactive AI Agent
+        # Navigation - Updated to include conversational mode
         page = st.radio(
             "Navigation",
-            ["Interactive AI Agent", "Bulk Ticket Dashboard"],  # Swapped order
+            ["Conversational AI Agent", "Interactive AI Agent", "Bulk Ticket Dashboard"],  # Added new mode
             key="navigation"
         )
         
@@ -876,7 +880,7 @@ def main():
                     count = st.session_state.rag_system.collection.count()
                     st.write(f"📚 Documents: {count}")
                 except:
-                    st.write("📚 Documents: Unknown")
+                    st.write(f"📚 Documents: Unknown")
             else:
                 st.warning("🟡 Classification Only Mode")
                 st.write("📚 Documents: ChromaDB unavailable")
@@ -886,11 +890,14 @@ def main():
     # Initialize RAG system
     initialize_rag_system()
     
-    # Main content area - Updated condition order
-    if page == "Interactive AI Agent":
+    # Main content area - Updated condition order to include conversational mode
+    if page == "Conversational AI Agent":
+        conversational_ai_mode()
+    elif page == "Interactive AI Agent":
         interactive_ai_agent()
     elif page == "Bulk Ticket Dashboard":
         bulk_ticket_dashboard()
+
 
 if __name__ == "__main__":
     main()
